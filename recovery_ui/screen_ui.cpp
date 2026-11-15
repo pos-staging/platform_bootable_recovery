@@ -416,7 +416,7 @@ ScreenRecoveryUI::ScreenRecoveryUI()
       max_stage(-1),
       locale_(""),
       rtl_locale_(false),
-      batt_capacity_(0),
+      batt_capacity_(-1),
       charging_(false),
       is_graphics_available(false) {}
 
@@ -587,11 +587,18 @@ void ScreenRecoveryUI::draw_foreground_locked() {
    fastboot light: #FDD835 */
 void ScreenRecoveryUI::SetColor(UIElement e) const {
   switch (e) {
+    // 25% steps: red -> orange -> yellow -> green.
+    case UIElement::BATTERY_CRITICAL:
+      gr_color(0xf9, 0x00, 0x00, 255);
+      break;
     case UIElement::BATTERY_LOW:
-      if (fastbootd_logo_enabled_)
-        gr_color(0xfd, 0x35, 0x35, 255);
-      else
-        gr_color(0xc7, 0x15, 0x85, 255);
+      gr_color(0xf9, 0xaa, 0x00, 255);
+      break;
+    case UIElement::BATTERY_MEDIUM:
+      gr_color(0xf9, 0xc2, 0x00, 255);
+      break;
+    case UIElement::BATTERY_HIGH:
+      gr_color(0x00, 0xf9, 0x00, 255);
       break;
     case UIElement::INFO:
       gr_color(0xfd, 0xd8, 0x35, 255);
@@ -887,11 +894,13 @@ void ScreenRecoveryUI::draw_menu_and_text_buffer_locked(
 
 // Draws the battery capacity on the screen. Should only be called with updateMutex locked.
 void ScreenRecoveryUI::draw_battery_capacity_locked() {
+  // Nothing to show on battery-less devices, or until healthd returns a real percentage.
+  if (is_battery_less || batt_capacity_ < 0) return;
+
   int x;
+  // Sit on the title row, under the logo, inset the same way as the menu.
   int y = margin_height_ + gr_get_height(lineage_logo_.get());
   int icon_x, icon_y, icon_h, icon_w;
-
-  if (is_battery_less) return;
 
   // Battery status
   std::string batt_capacity = std::to_string(batt_capacity_) + '%';
@@ -902,15 +911,23 @@ void ScreenRecoveryUI::draw_battery_capacity_locked() {
     batt_capacity.pop_back();
 
   if (menu_) {
-    // Battery icon
-    x = (ScreenWidth() - margin_width_ * 2 - kMenuIndent) - char_width_;
+    UIElement colorElement = UIElement::BATTERY_HIGH;
+    if (batt_capacity_ < 25)
+      colorElement = UIElement::BATTERY_CRITICAL;
+    else if (batt_capacity_ < 50)
+      colorElement = UIElement::BATTERY_LOW;
+    else if (batt_capacity_ < 75)
+      colorElement = UIElement::BATTERY_MEDIUM;
 
-    SetColor(UIElement::INFO);
+    // Extra character of right padding so the icon clears the rounded margin.
+    x = (ScreenWidth() - margin_width_ * 2 - kMenuIndent) - char_width_ * 2;
+
+    SetColor(colorElement);
 
     // Top
-    icon_x = x + char_width_ / 3;
+    icon_x = x + char_width_ / 4;
     icon_y = y;
-    icon_w = char_width_ / 3;
+    icon_w = char_width_ / 2;
     icon_h = char_height_ / 12;
     gr_fill(icon_x, icon_y, icon_x + icon_w, icon_y + icon_h);
 
@@ -922,7 +939,7 @@ void ScreenRecoveryUI::draw_battery_capacity_locked() {
     gr_fill(icon_x, icon_y, icon_x + icon_w, icon_y + icon_h);
 
     // Capacity
-    if (batt_capacity_ <= 15) SetColor(UIElement::BATTERY_LOW);
+    SetColor(colorElement);
     icon_x = x + char_width_ / 6;
     icon_y = y + char_height_ / 12;
     icon_w = char_width_ - (2 * char_width_ / 6);
@@ -935,7 +952,7 @@ void ScreenRecoveryUI::draw_battery_capacity_locked() {
     x -= char_width_;  // Separator
 
     // Battery text
-    SetColor(UIElement::INFO);
+    SetColor(colorElement);
     x -= batt_capacity.size() * char_width_;
     DrawTextLine(x, icon_y, batt_capacity.c_str(), false);
   }
@@ -1003,10 +1020,16 @@ void ScreenRecoveryUI::BattMonitorThreadLoop() {
       }
       is_first_call = false;
 
-      // If we can't read battery percentage, it may be a device without battery. In this
-      // situation, use 100 as a fake battery percentage.
+      // If we can't read battery percentage, hide the icon instead of drawing a fake level.
+      // The startup retry above covers drivers that are not ready yet; give up after that.
       if (status != android::OK) {
-        prop.valueInt64 = 100;
+        LOG(WARNING) << "Can't read battery percentage";
+        if (batt_capacity_ != -1) {
+          batt_capacity_ = -1;
+          redraw = true;
+        }
+        if (redraw) update_screen_locked();
+        return;
       }
 
       int32_t batt_capacity = static_cast<int32_t>(prop.valueInt64);
